@@ -113,6 +113,10 @@ impl HistoryCursor {
         Ok(())
     }
 
+    pub(crate) fn entry_at_cursor(&self) -> Option<&HistoryItem> {
+        self.current.as_ref()
+    }
+
     /// Returns the string (if present) at the cursor
     pub fn string_at_cursor(&self) -> Option<String> {
         self.current.as_ref().map(|e| e.command_line.to_string())

@@ -72,6 +72,72 @@ impl<'prompt> PromptLines<'prompt> {
         }
     }
 
+    pub(crate) fn scroll_horizontally(&mut self, columns: u16) {
+        use super::utils::strip_ansi;
+        use unicode_width::UnicodeWidthChar;
+
+        let prompt_columns = line_width(&self.prompt_str_left) + line_width(&self.prompt_indicator);
+        let available = usize::from(columns).saturating_sub(prompt_columns + 1);
+        let before = strip_ansi(&self.before_cursor).replace('\n', "^J");
+        let after = strip_ansi(&self.after_cursor).replace('\n', "^J");
+        if !self.before_cursor.contains('\n')
+            && !self.after_cursor.contains('\n')
+            && line_width(&before) + line_width(&after) <= available
+        {
+            self.hint = Cow::Borrowed("");
+            return;
+        }
+
+        let drops_left = line_width(&before) > available;
+        let available = if drops_left {
+            self.prompt_str_left = Cow::Borrowed("");
+            self.prompt_indicator = Cow::Borrowed("");
+            usize::from(columns).saturating_sub(1)
+        } else {
+            available
+        };
+        let before_limit = available.saturating_sub(usize::from(drops_left));
+        let mut shown_before = 0;
+        let mut start = before.len();
+        for (offset, c) in before.char_indices().rev() {
+            let width = c.width().unwrap_or(0);
+            if shown_before + width > before_limit {
+                break;
+            }
+            shown_before += width;
+            start = offset;
+        }
+        let after_limit = before_limit.saturating_sub(shown_before);
+        let drops_right = line_width(&after) > after_limit;
+        let mut shown_after = 0;
+        let mut end = 0;
+        for (offset, c) in after.char_indices() {
+            let width = c.width().unwrap_or(0);
+            if shown_after + width > after_limit.saturating_sub(usize::from(drops_right)) {
+                break;
+            }
+            shown_after += width;
+            end = offset + c.len_utf8();
+        }
+
+        if self.exit_after_cursor.is_none() {
+            self.exit_after_cursor = Some(self.after_cursor.clone());
+        }
+        let left = if drops_left && available != 0 {
+            "<"
+        } else {
+            ""
+        };
+        let right = if drops_right && after_limit != 0 {
+            ">"
+        } else {
+            ""
+        };
+        self.before_cursor = Cow::Owned(format!("{left}{}", &before[start..]));
+        self.after_cursor = Cow::Owned(format!("{}{right}", &after[..end]));
+        self.hint = Cow::Borrowed("");
+    }
+
     /// Set the status line drawn below the buffer. See [`Self::status`].
     ///
     /// Trailing line breaks are dropped: the rows count stops at the last

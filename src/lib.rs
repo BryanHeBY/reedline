@@ -272,8 +272,9 @@ pub use enums::{
 mod painting;
 pub use painting::{Painter, StyledText, TerminalTakenSignal};
 
+mod byte_buffer;
 mod engine;
-pub use engine::{EditorCommand, MouseClickMode, Reedline, RepaintSignal};
+pub use engine::{EditorCommand, LineDisplay, MouseClickMode, Reedline, RepaintSignal};
 
 #[cfg(feature = "system_clipboard")]
 mod paste_interceptor;
