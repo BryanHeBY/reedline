@@ -34,4 +34,9 @@ pub trait StatusLine: Send {
     /// buffer. It is asked for on every repaint with a row free below the
     /// buffer, so cache by `line` if producing it is expensive.
     fn status(&mut self, line: &str, pos: usize, columns: u16, use_ansi_coloring: bool) -> String;
+
+    /// Called when editing leaves no room for a status line or its text is
+    /// too tall to draw. Hosts can use this to route output that must remain
+    /// visible to an external printer. May be called on successive repaints.
+    fn status_unavailable(&mut self) {}
 }

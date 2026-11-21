@@ -4031,9 +4031,15 @@ impl Reedline {
         let mut lines = lines
             .with_status(&status, use_ansi_coloring)
             .with_footer(&footer, use_ansi_coloring);
+        let status_rows = lines.status_rows(screen_width);
+        if !self.hide_hints && (status_room == 0 || status_rows > status_room) {
+            if let Some(status_line) = self.status_line.as_mut() {
+                status_line.status_unavailable();
+            }
+        }
         // Before the menus size themselves below the status line.
         self.painter.reserve_status_and_footer_rows(
-            lines.status_rows(screen_width),
+            status_rows,
             lines.footer_rows(screen_width),
             status_room,
         );
