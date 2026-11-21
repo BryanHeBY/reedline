@@ -3987,9 +3987,14 @@ impl Reedline {
             _ => String::new(),
         };
         let mut lines = lines.with_status(&status, use_ansi_coloring);
+        let status_rows = lines.status_rows(screen_width);
+        if !self.hide_hints && (status_room == 0 || status_rows > status_room) {
+            if let Some(status_line) = self.status_line.as_mut() {
+                status_line.status_unavailable();
+            }
+        }
         // Before the menus size themselves below the status line.
-        self.painter
-            .reserve_status_rows(lines.status_rows(screen_width), status_room);
+        self.painter.reserve_status_rows(status_rows, status_room);
 
         // Updating the working details of the active menu
         for menu in self.menus.iter_mut() {
