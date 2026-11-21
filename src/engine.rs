@@ -3810,9 +3810,90 @@ impl Reedline {
             .unwrap_or_else(|| self.editor.insertion_point());
         let buffer_to_paint = self.editor.get_buffer();
 
-        let mut styled_text = self
-            .highlighter
-            .highlight(buffer_to_paint, cursor_position_in_buffer);
+        // With only auto-pair closers after the cursor, as in `(gs|)`, a
+        // hinter that continues the text before it hints from that text and
+        // its hint is drawn in place of the closers. A hint the highlighter
+        // does not see closing them would drop them on accept, so none shows.
+        let trailing_closers = self.trailing_closers_for_hint().map(str::to_owned);
+        let hinted_line = match trailing_closers {
+            Some(_) => &buffer_to_paint[..cursor_position_in_buffer],
+            None => buffer_to_paint,
+        };
+
+        // Decided from the hint this paint looked up, never a stale one: the
+        // paint that submit makes with hints hidden must draw the closers.
+        let mut hint_replaces_closers = false;
+        // Escaped here rather than in each hinter, so a host's own hinter is
+        // covered too. SGR is kept only while coloring is on: hinters style
+        // their own output, and with coloring off any SGR came from history.
+        let hint: String = if self.hints_active() {
+            self.hinter.as_mut().map_or_else(String::new, |hinter| {
+                let hint = hinter.handle(
+                    hinted_line,
+                    cursor_position_in_buffer,
+                    self.history.as_ref(),
+                    use_ansi_coloring,
+                    &self.cwd.clone().unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    }),
+                );
+                let hint = if use_ansi_coloring {
+                    escape_control_keep_sgr(&hint).into_owned()
+                } else {
+                    escape_control(&hint).into_owned()
+                };
+                let hint = continue_hint_lines(
+                    hint,
+                    prompt,
+                    use_ansi_coloring,
+                    self.painter.semantic_markers(),
+                );
+                let Some(closers) = trailing_closers.as_deref() else {
+                    return hint;
+                };
+                // The raw hint, not the escaped one: the closers' offsets
+                // index what accepting inserts.
+                let full = hinter.complete_hint();
+                hint_replaces_closers = !full.is_empty()
+                    && closer_offsets_for_hint(
+                        self.highlighter.as_ref(),
+                        buffer_to_paint,
+                        cursor_position_in_buffer,
+                        &full,
+                        closers,
+                    )
+                    .is_some();
+                if hint_replaces_closers {
+                    hint
+                } else {
+                    String::new()
+                }
+            })
+        } else {
+            String::new()
+        };
+
+        let horizontal_scroll = self.line_display.horizontal_scroll
+            || (self.editing_history && self.painter.screen_height() == 1);
+        let inline_hint = if use_ansi_coloring
+            && !hint.is_empty()
+            && cursor_position_in_buffer == buffer_to_paint.len()
+            && !horizontal_scroll
+            && !self.byte_oriented
+            && !self.menus.iter().any(|menu| menu.is_active())
+        {
+            self.hinter.as_ref().map(|hinter| hinter.complete_hint())
+        } else {
+            None
+        };
+        let mut styled_text = self.highlighter.highlight_with_hint(
+            buffer_to_paint,
+            cursor_position_in_buffer,
+            inline_hint.as_deref().filter(|hint| !hint.is_empty()),
+        );
         if let Some((from, to)) = self.editor.get_selection() {
             // With a cursor-cell style configured, the head cell gets it and
             // the selection style covers the rest of the range.
@@ -3880,72 +3961,6 @@ impl Reedline {
                 }
             });
 
-        // With only auto-pair closers after the cursor, as in `(gs|)`, a
-        // hinter that continues the text before it hints from that text and
-        // its hint is drawn in place of the closers. A hint the highlighter
-        // does not see closing them would drop them on accept, so none shows.
-        let trailing_closers = self.trailing_closers_for_hint().map(str::to_owned);
-        let hinted_line = match trailing_closers {
-            Some(_) => &buffer_to_paint[..cursor_position_in_buffer],
-            None => buffer_to_paint,
-        };
-
-        // Decided from the hint this paint looked up, never a stale one: the
-        // paint that submit makes with hints hidden must draw the closers.
-        let mut hint_replaces_closers = false;
-        // Escaped here rather than in each hinter, so a host's own hinter is
-        // covered too. SGR is kept only while coloring is on: hinters style
-        // their own output, and with coloring off any SGR came from history.
-        let hint: String = if self.hints_active() {
-            self.hinter.as_mut().map_or_else(String::new, |hinter| {
-                let hint = hinter.handle(
-                    hinted_line,
-                    cursor_position_in_buffer,
-                    self.history.as_ref(),
-                    use_ansi_coloring,
-                    &self.cwd.clone().unwrap_or_else(|| {
-                        std::env::current_dir()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string()
-                    }),
-                );
-                let hint = if use_ansi_coloring {
-                    escape_control_keep_sgr(&hint).into_owned()
-                } else {
-                    escape_control(&hint).into_owned()
-                };
-                let hint = continue_hint_lines(
-                    hint,
-                    prompt,
-                    use_ansi_coloring,
-                    self.painter.semantic_markers(),
-                );
-                let Some(closers) = trailing_closers.as_deref() else {
-                    return hint;
-                };
-                // The raw hint, not the escaped one: the closers' offsets
-                // index what accepting inserts.
-                let full = hinter.complete_hint();
-                hint_replaces_closers = !full.is_empty()
-                    && closer_offsets_for_hint(
-                        self.highlighter.as_ref(),
-                        buffer_to_paint,
-                        cursor_position_in_buffer,
-                        &full,
-                        closers,
-                    )
-                    .is_some();
-                if hint_replaces_closers {
-                    hint
-                } else {
-                    String::new()
-                }
-            })
-        } else {
-            String::new()
-        };
-
         // Needs to add return carriage to newlines because when not in raw mode
         // some OS don't fully return the carriage
 
@@ -3974,9 +3989,7 @@ impl Reedline {
         if history_modified {
             lines.prompt_str_left.to_mut().insert(0, '*');
         }
-        if self.line_display.horizontal_scroll
-            || (self.editing_history && self.painter.screen_height() == 1)
-        {
+        if horizontal_scroll {
             lines.scroll_horizontally(self.painter.screen_width());
         }
         // History search paints elsewhere, so only submit hides the status
