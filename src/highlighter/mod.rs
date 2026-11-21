@@ -27,6 +27,16 @@ pub trait Highlighter: Send {
     /// Cursor position as byte offsets in the string
     fn highlight(&self, line: &str, cursor: usize) -> StyledText;
 
+    /// Style the editable buffer with the option to use a visible inline hint
+    /// as context. `hint` is the unstyled text beyond the end of `line`, when
+    /// available. The returned text still represents only `line`.
+    ///
+    /// The default implementation uses [`Self::highlight`].
+    fn highlight_with_hint(&self, line: &str, cursor: usize, hint: Option<&str>) -> StyledText {
+        let _ = hint;
+        self.highlight(line, cursor)
+    }
+
     /// Returns `true` if an abbreviation should be expanded at the given cursor position
     /// (a byte offset into `line`), `false` if expansion should be suppressed
     ///
