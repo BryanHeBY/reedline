@@ -2106,7 +2106,11 @@ impl Reedline {
                     if self.suspended_state.is_none() {
                         // We are about to quit the editor, move the cursor below the input
                         // area, for external commands or new read_line call
-                        self.painter.move_cursor_to_end()?;
+                        let interrupt = match signal {
+                            Signal::CtrlC(_) => self.line_display.echo_interrupt,
+                            _ => None,
+                        };
+                        self.painter.move_cursor_to_end(interrupt)?;
                     }
                     // A clear earlier in this batch left it hidden and no
                     // paint follows. The exit is what to report, so a failed
@@ -2207,7 +2211,6 @@ impl Reedline {
                 }
             }
             ReedlineEvent::CtrlC => {
-                self.echo_interrupt()?;
                 self.recalled_history = None;
                 self.input_mode = InputMode::Regular;
                 // The line from before the search, not the search query. It is
@@ -2477,7 +2480,6 @@ impl Reedline {
                 }
             }
             ReedlineEvent::CtrlC => {
-                self.echo_interrupt()?;
                 self.recalled_history = None;
                 self.deactivate_menus();
                 let buffer = self.editor.get_buffer().to_string();
@@ -2886,13 +2888,6 @@ impl Reedline {
         self.menus
             .iter_mut()
             .for_each(|menu| menu.menu_event(MenuEvent::Deactivate));
-    }
-
-    fn echo_interrupt(&mut self) -> io::Result<()> {
-        if let Some(character) = self.line_display.echo_interrupt {
-            self.painter.paint_line(&format!("^{character}"))?;
-        }
-        Ok(())
     }
 
     fn save_history_edit(&mut self) {

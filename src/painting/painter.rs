@@ -2024,7 +2024,7 @@ impl Painter {
     /// unconditional and only the after-cursor text goes back. Text before the
     /// cursor survives, leaving a rejected command on screen as the record of
     /// what was aborted (#1143).
-    pub(crate) fn move_cursor_to_end(&mut self) -> Result<()> {
+    pub(crate) fn move_cursor_to_end(&mut self, interrupt: Option<char>) -> Result<()> {
         self.stdout.queue(Clear(ClearType::FromCursorDown))?;
         if let Some(after_cursor) = &self.after_cursor_lines {
             self.stdout.queue(Print(after_cursor))?;
@@ -2037,6 +2037,9 @@ impl Painter {
                 .queue(SetAttribute(Attribute::Reset))?
                 .queue(ResetColor)?
                 .queue(RestorePosition)?;
+        }
+        if let Some(character) = interrupt {
+            self.stdout.queue(Print('^'))?.queue(Print(character))?;
         }
         self.print_crlf()
     }
@@ -2620,7 +2623,8 @@ mod tests {
         };
 
         paint(&mut p);
-        p.move_cursor_to_end().expect("move_cursor_to_end failed");
+        p.move_cursor_to_end(None)
+            .expect("move_cursor_to_end failed");
         let exit_end = p.stdout.captured().len();
         p.initialize_prompt_position_with_size((20, 10), None)
             .expect("anchor failed");
@@ -3427,7 +3431,7 @@ mod tests {
 
         // Only the exit's own output is under test.
         painter.stdout = W::capture();
-        painter.move_cursor_to_end().unwrap();
+        painter.move_cursor_to_end(None).unwrap();
 
         let out = String::from_utf8_lossy(painter.stdout.captured()).into_owned();
         assert!(
@@ -4048,7 +4052,8 @@ mod tests {
             &None,
         )
         .expect("repaint_buffer failed");
-        p.move_cursor_to_end().expect("move_cursor_to_end failed");
+        p.move_cursor_to_end(None)
+            .expect("move_cursor_to_end failed");
 
         replay(&String::from_utf8_lossy(p.stdout.captured()), 20, false)
     }
