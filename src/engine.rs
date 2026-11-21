@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
     mem,
     ops::ControlFlow,
@@ -80,6 +80,71 @@ const EVENTS_THRESHOLD: usize = 10;
 /// for features that require periodic processing (e.g., external printer,
 /// idle callback).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Optional Readline-compatible presentation and history editing behavior.
+#[derive(Default)]
+pub struct LineDisplay {
+    /// Display the edit buffer in a single scrolling row.
+    pub horizontal_scroll: bool,
+    /// Echo an interrupt character in caret notation before leaving the editor.
+    pub echo_interrupt: Option<char>,
+    /// Briefly show the match when typing a closing bracket.
+    pub blink_matching_bracket: bool,
+    /// Escape sequences framing pasted text and incremental history matches.
+    pub active_region: Option<(String, String)>,
+    /// Mark recalled lines that differ from their original text.
+    pub mark_modified_history: bool,
+    /// Submit the selected command when Enter ends incremental history search.
+    pub accept_history_search: bool,
+    /// Clear temporary changes to history entries when a line is accepted.
+    pub revert_history_on_submit: bool,
+}
+
+fn active_region_text(
+    text: &str,
+    region: std::ops::Range<usize>,
+    colors: &(String, String),
+) -> String {
+    if let (Some(before), Some(region_text), Some(after)) = (
+        text.get(..region.start),
+        text.get(region.clone()),
+        text.get(region.end..),
+    ) {
+        format!(
+            "{}{}{}{}{}",
+            escape_control(before),
+            colors.0,
+            escape_control(region_text),
+            colors.1,
+            escape_control(after)
+        )
+    } else {
+        escape_control(text).into_owned()
+    }
+}
+
+fn matching_open_bracket(buffer: &str, cursor: usize) -> Option<usize> {
+    let mut prefix = buffer.get(..cursor)?.char_indices().rev();
+    let (_, closing) = prefix.next()?;
+    let opening = match closing {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        _ => return None,
+    };
+    let mut depth = 1;
+    for (offset, character) in prefix {
+        if character == closing {
+            depth += 1;
+        } else if character == opening {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
 
 /// Where history navigation leaves the cursor in the entry it shows.
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +242,13 @@ pub struct Reedline {
     // History
     history: Box<dyn History>,
     history_cursor: HistoryCursor,
+    line_display: LineDisplay,
+    byte_oriented: bool,
+    pasted_region: Option<std::ops::Range<usize>>,
+    blink_cursor: Option<usize>,
+    editing_history: bool,
+    recalled_history: Option<(HistoryItemId, String)>,
+    history_edits: HashMap<HistoryItemId, String>,
     history_session_id: Option<HistorySessionId>,
     history_last_run: HistoryLastRun,
     history_exclusion_prefix: Option<String>,
@@ -268,6 +340,11 @@ pub struct Reedline {
 
     // Manage optional kitty protocol
     kitty_protocol: KittyProtocolGuard,
+
+    // Physical input buffered while synthetic key events are replaying.
+    ordered_events: Option<VecDeque<Event>>,
+    ordered_repaint: bool,
+    input_source: Option<Box<dyn FnMut(Duration) -> io::Result<Option<Event>> + Send>>,
 
     // Whether lines should be accepted immediately
     immediately_accept: bool,
@@ -559,6 +636,13 @@ impl Reedline {
         Reedline {
             editor: Editor::default(),
             history,
+            line_display: LineDisplay::default(),
+            byte_oriented: false,
+            pasted_region: None,
+            blink_cursor: None,
+            editing_history: false,
+            recalled_history: None,
+            history_edits: HashMap::new(),
             history_cursor: HistoryCursor::new(
                 HistoryNavigationQuery::Normal(LineBuffer::default()),
                 hist_session_id,
@@ -599,6 +683,9 @@ impl Reedline {
             cursor_shapes: None,
             bracketed_paste: BracketedPasteGuard::default(),
             kitty_protocol: KittyProtocolGuard::default(),
+            ordered_events: None,
+            ordered_repaint: false,
+            input_source: None,
             immediately_accept: false,
             break_signal: None,
             repaint_signal: None,
@@ -1284,6 +1371,115 @@ impl Reedline {
         self.history_save_error.take()
     }
 
+    /// Dispatches each input event before decoding the next one.
+    ///
+    /// Lets an edit mode replay keys through its normal event parser, including
+    /// across successful submissions and host callbacks. Bracketed pastes
+    /// are still delivered as single events.
+    #[must_use]
+    pub fn with_ordered_input(mut self, enable: bool) -> Self {
+        self.ordered_events = enable.then(VecDeque::new);
+        self
+    }
+
+    /// Installs an optional terminal event reader for ordered input. The
+    /// reader returns None when no event arrives within the supplied timeout.
+    pub fn set_input_source(
+        &mut self,
+        source: Option<Box<dyn FnMut(Duration) -> io::Result<Option<Event>> + Send>>,
+    ) {
+        self.input_source = source;
+    }
+
+    /// Uses the host's cursor-position reader for terminal queries. A custom
+    /// input source and the cursor reader should share the same event stream.
+    pub fn set_cursor_position_query(
+        &mut self,
+        query: Option<Box<dyn Fn() -> io::Result<(u16, u16)> + Send + Sync>>,
+    ) {
+        self.painter.cursor_query = query;
+    }
+
+    /// Updates presentation options for subsequent input.
+    pub fn set_line_display(&mut self, display: LineDisplay) {
+        self.line_display = display;
+    }
+
+    /// Preserve edits made while visiting entries during history traversal.
+    pub fn set_editable_history(&mut self, enabled: bool) {
+        self.editing_history = enabled;
+    }
+
+    /// Edits text as bytes, permitting motion and deletion inside a UTF-8 character.
+    ///
+    /// The public strings returned by the editor replace invalid UTF-8 at the
+    /// boundary. The active buffer retains the original bytes for further edits.
+    pub fn set_byte_oriented(&mut self, enabled: bool) {
+        if enabled == self.byte_oriented {
+            return;
+        }
+        let old = self.editor.get_buffer();
+        let old_position = self.editor.insertion_point();
+        let (buffer, position) = if enabled {
+            let encoded = crate::byte_buffer::encode(old);
+            let position = crate::byte_buffer::offset(&encoded, old_position);
+            (encoded, position)
+        } else {
+            let position = crate::byte_buffer::decode(&old[..old_position]).len();
+            let decoded = crate::byte_buffer::decode(old).into_owned();
+            let position = decoded.floor_char_boundary(position);
+            (decoded, position)
+        };
+        self.byte_oriented = enabled;
+        self.editor.clear_selection();
+        self.editor
+            .set_buffer(buffer, UndoBehavior::HistoryNavigation);
+        self.editor.line_buffer_mut().set_insertion_point(position);
+        self.editor.reset_undo_stack();
+        self.pasted_region = None;
+    }
+
+    /// Returns the text and the byte position for a host callback.
+    pub fn host_buffer(&self) -> (String, usize) {
+        let buffer = self.editor.get_buffer();
+        let position = self.editor.insertion_point();
+        if self.byte_oriented {
+            (
+                crate::byte_buffer::decode(buffer).into_owned(),
+                buffer[..position].chars().count(),
+            )
+        } else {
+            (buffer.to_owned(), position)
+        }
+    }
+
+    /// Replaces the text and byte position returned by a host callback.
+    pub fn set_host_buffer(&mut self, buffer: String, cursor: usize) {
+        let (current, current_cursor) = self.host_buffer();
+        let cursor = if self.byte_oriented {
+            cursor
+        } else {
+            buffer.floor_char_boundary(cursor.min(buffer.len()))
+        };
+        if current == buffer {
+            if current_cursor != cursor {
+                self.run_edit_commands(&[EditCommand::MoveToPosition {
+                    position: cursor,
+                    select: false,
+                }]);
+            }
+            return;
+        }
+        self.run_edit_commands(&[
+            EditCommand::Clear,
+            EditCommand::InsertString(buffer),
+            EditCommand::MoveToPosition {
+                position: cursor,
+                select: false,
+            },
+        ]);
+    }
+
     /// Wait for input and provide the user with a specified [`Prompt`].
     ///
     /// Returns a [`std::io::Result`] in which the `Err` type is [`std::io::Result`]
@@ -1396,6 +1592,7 @@ impl Reedline {
     /// in a `raw_mode` context.
     fn read_line_helper(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
         let suspended_state = self.begin_read();
+        self.ordered_repaint = false;
         self.painter
             .initialize_prompt_position(suspended_state.as_ref())?;
         self.repaint(prompt)?;
@@ -1442,6 +1639,35 @@ impl Reedline {
 
             if status == CompletionStatus::Ready {
                 self.settle_completions(prompt)?;
+            }
+
+            if !self.immediately_accept && self.ordered_events.is_some() {
+                let replay = self.edit_mode.next_replay_event().map(Event::from);
+                let next = replay.or_else(|| self.ordered_events.as_mut()?.pop_front());
+                if let Some(event) = next {
+                    let next_physical_key = self.ordered_events.as_ref().and_then(VecDeque::front);
+                    let defer_insert_repaint = burst_char(&event).is_some()
+                        && next_physical_key.and_then(burst_char).is_some();
+                    if let ControlFlow::Break(signal) =
+                        self.dispatch_input_batch(prompt, vec![event], defer_insert_repaint)?
+                    {
+                        return Ok(signal);
+                    }
+                    continue;
+                }
+            }
+
+            if !self.immediately_accept && self.ordered_events.is_some() {
+                if let Some(source) = &mut self.input_source {
+                    if let Some(event) = source(self.poll_interval)? {
+                        if let ControlFlow::Break(signal) =
+                            self.process_input_batch(prompt, vec![event])?
+                        {
+                            return Ok(signal);
+                        }
+                    }
+                    continue;
+                }
             }
 
             let mut events: Vec<Event> = vec![];
@@ -1510,6 +1736,16 @@ impl Reedline {
             // `events` stays empty, but `process_input_batch` still pushes the
             // synthetic `Submit` and returns the buffer. Gating this call behind
             // `!immediately_accept` would spin the loop forever.
+            let burst = self
+                .paste_burst
+                .as_ref()
+                .is_some_and(|hook| hook.is_burst_active());
+            if !burst && !self.immediately_accept {
+                if let Some(queue) = &mut self.ordered_events {
+                    queue.extend(events);
+                    continue;
+                }
+            }
             let batch_result = self.process_input_batch(prompt, events)?;
             self.settle_paste_burst();
             if let ControlFlow::Break(signal) = batch_result {
@@ -1665,6 +1901,15 @@ impl Reedline {
         prompt: &dyn Prompt,
         events: Vec<Event>,
     ) -> Result<ControlFlow<Signal>> {
+        self.dispatch_input_batch(prompt, events, false)
+    }
+
+    fn dispatch_input_batch(
+        &mut self,
+        prompt: &dyn Prompt,
+        events: Vec<Event>,
+        defer_insert_repaint: bool,
+    ) -> Result<ControlFlow<Signal>> {
         // Convert `Event` into `ReedlineEvent`. Also, fuse consecutive
         // `ReedlineEvent::EditCommand` into one. Also, if there're multiple
         // `ReedlineEvent::Resize`, only keep the last one.
@@ -1690,6 +1935,24 @@ impl Reedline {
         // pushes every event it reads, so a resize arriving mid-paste lands in
         // the burst batch too and must not be swallowed there.
         let mut resize = None;
+        let paste_start = events
+            .iter()
+            .any(|event| matches!(event, Event::Paste(_)))
+            .then(|| self.editor.insertion_point());
+        let typed_bracket = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Key(key) if key.kind != KeyEventKind::Release
+                    && matches!(key.code, KeyCode::Char(')' | ']' | '}'))
+                    && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            )
+        });
+        if events
+            .iter()
+            .any(|event| matches!(event, Event::Key(key) if key.kind != KeyEventKind::Release))
+        {
+            self.pasted_region = None;
+        }
         if burst_batch {
             let mut coalesced = String::new();
             // Every Enter drained into this batch is coalesced as an embedded
@@ -1782,6 +2045,13 @@ impl Reedline {
             reedline_events.push(ReedlineEvent::Submit);
         }
 
+        // Consume events in order, but a run of already buffered character
+        // keys need only be painted once. Non-trivial actions still repaint
+        // at the point they happen, including bracket flashes and pastes.
+        let defer_insert_repaint = defer_insert_repaint
+            && !typed_bracket
+            && matches!(reedline_events.as_slice(), [ReedlineEvent::Edit(edits)]
+                if matches!(edits.as_slice(), [EditCommand::InsertChar(_)]));
         // The mode machine has parsed this batch, so the rest policy it
         // declares is now final. Relay it to the editor before running the
         // emitted commands so a command a mode transition issued (e.g. the
@@ -1823,7 +2093,13 @@ impl Reedline {
         if self.editor.policy_unsettled() {
             need_repaint = true;
         }
-        if need_repaint {
+        if let Some(start) = paste_start {
+            let end = self.editor.insertion_point();
+            self.pasted_region = (end > start).then_some(start..end);
+        }
+        need_repaint |= self.ordered_repaint;
+        self.ordered_repaint = need_repaint && defer_insert_repaint;
+        if need_repaint && !defer_insert_repaint {
             // Sync the editor's edit mode before painting so the cursor is
             // normalized under the current rest policy. A mode change that
             // bypasses the command path (e.g. Esc → Vi normal) otherwise
@@ -1831,16 +2107,39 @@ impl Reedline {
             // the last grapheme for a frame.
             let mode = self.edit_mode.edit_mode();
             self.editor.set_edit_mode(mode);
+            if self.line_display.blink_matching_bracket && typed_bracket {
+                self.blink_cursor =
+                    matching_open_bracket(self.editor.get_buffer(), self.editor.insertion_point());
+                if self.blink_cursor.is_some() {
+                    let result = self.repaint(prompt);
+                    self.blink_cursor = None;
+                    result?;
+                    let delay = Duration::from_millis(500);
+                    if self.input_source.is_some() {
+                        std::thread::sleep(delay);
+                    } else {
+                        let _ = event::poll(delay)?;
+                    }
+                }
+            }
             self.repaint(prompt)?;
         }
         Ok(ControlFlow::Continue(()))
     }
 
     fn handle_event(&mut self, prompt: &dyn Prompt, event: ReedlineEvent) -> Result<EventStatus> {
-        if self.input_mode == InputMode::HistorySearch {
-            self.handle_history_search_event(event)
+        if self.input_mode != InputMode::HistorySearch {
+            return self.handle_editor_event(prompt, event);
+        }
+
+        let submit = self.line_display.accept_history_search
+            && matches!(event, ReedlineEvent::Enter | ReedlineEvent::Submit)
+            && self.history_cursor.entry_at_cursor().is_some();
+        let status = self.handle_history_search_event(event)?;
+        if submit && matches!(status, EventStatus::Handled) {
+            self.handle_editor_event(prompt, ReedlineEvent::Submit)
         } else {
-            self.handle_editor_event(prompt, event)
+            Ok(status)
         }
     }
 
@@ -1872,6 +2171,8 @@ impl Reedline {
                 }
             }
             ReedlineEvent::CtrlC => {
+                self.echo_interrupt()?;
+                self.recalled_history = None;
                 self.input_mode = InputMode::Regular;
                 // The line from before the search, not the search query. It is
                 // abandoned like any other, so the next read starts empty.
@@ -1893,8 +2194,13 @@ impl Reedline {
             | ReedlineEvent::Submit
             | ReedlineEvent::SubmitOrNewline => {
                 if let Some(string) = self.history_cursor.string_at_cursor() {
+                    let buffer = if self.byte_oriented {
+                        crate::byte_buffer::encode(&string)
+                    } else {
+                        string
+                    };
                     self.editor
-                        .set_buffer(string, UndoBehavior::CreateUndoPoint);
+                        .set_buffer(buffer, UndoBehavior::CreateUndoPoint);
                 }
 
                 self.input_mode = InputMode::Regular;
@@ -2135,6 +2441,8 @@ impl Reedline {
                 }
             }
             ReedlineEvent::CtrlC => {
+                self.echo_interrupt()?;
+                self.recalled_history = None;
                 self.deactivate_menus();
                 let buffer = self.editor.get_buffer().to_string();
                 self.run_edit_commands(&[EditCommand::Clear]);
@@ -2164,6 +2472,11 @@ impl Reedline {
                 }
 
                 let buffer = self.editor.get_buffer().to_string();
+                let buffer = if self.byte_oriented {
+                    crate::byte_buffer::decode(&buffer)
+                } else {
+                    std::borrow::Cow::Borrowed(buffer.as_str())
+                };
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
                     None | Some(ValidationResult::Complete) => Ok(self.submit_buffer(prompt)?),
                     Some(ValidationResult::Incomplete) => {
@@ -2205,6 +2518,11 @@ impl Reedline {
                     self.run_edit_commands(&[EditCommand::InsertNewline]);
                     return Ok(EventStatus::Handled);
                 }
+                let buffer = if self.byte_oriented {
+                    crate::byte_buffer::decode(&buffer)
+                } else {
+                    std::borrow::Cow::Borrowed(buffer.as_str())
+                };
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
                     None | Some(ValidationResult::Complete) => Ok(self.submit_buffer(prompt)?),
                     Some(ValidationResult::Incomplete) => {
@@ -2534,9 +2852,37 @@ impl Reedline {
             .for_each(|menu| menu.menu_event(MenuEvent::Deactivate));
     }
 
+    fn echo_interrupt(&mut self) -> io::Result<()> {
+        if let Some(character) = self.line_display.echo_interrupt {
+            self.painter.paint_line(&format!("^{character}"))?;
+        }
+        Ok(())
+    }
+
+    fn save_history_edit(&mut self) {
+        if self.editing_history {
+            if let Some((id, original)) = &self.recalled_history {
+                let buffer = self.editor.get_buffer();
+                let buffer = if self.byte_oriented {
+                    crate::byte_buffer::decode(buffer)
+                } else {
+                    buffer.into()
+                };
+                if buffer == *original {
+                    self.history_edits.remove(id);
+                } else {
+                    self.history_edits.insert(*id, buffer.into_owned());
+                }
+            }
+        }
+    }
+
     fn previous_history(&mut self) -> io::Result<()> {
+        self.save_history_edit();
         self.history_last_run.set_recalled(false);
-        if self.input_mode != InputMode::HistoryTraversal {
+        if self.input_mode != InputMode::HistoryTraversal
+            && !(self.editing_history && self.recalled_history.is_some())
+        {
             self.input_mode = InputMode::HistoryTraversal;
             self.history_cursor = HistoryCursor::new(
                 self.get_history_navigation_based_on_line_buffer(),
@@ -2552,6 +2898,7 @@ impl Reedline {
             // On `Err` the next press retries on the fresh cursor; no rollback.
             self.history_cursor.back(self.history.as_ref())?;
         }
+        self.input_mode = InputMode::HistoryTraversal;
         self.show_history_entry(HistoryLanding::FirstLineEnd);
         Ok(())
     }
@@ -2560,6 +2907,25 @@ impl Reedline {
     /// the buffer, with the cursor where `landing` says.
     fn show_history_entry(&mut self, landing: HistoryLanding) {
         self.update_buffer_from_history();
+        self.recalled_history = if self.editing_history && !self.history_last_run.is_recalled() {
+            self.history_cursor.entry_at_cursor().and_then(|entry| {
+                let id = entry.id?;
+                let edited = self.history_edits.get(&id);
+                if self.byte_oriented {
+                    let text = edited.unwrap_or(&entry.command_line);
+                    self.editor.set_buffer(
+                        crate::byte_buffer::encode(text),
+                        UndoBehavior::HistoryNavigation,
+                    );
+                } else if let Some(edited) = edited {
+                    self.editor
+                        .set_buffer(edited.clone(), UndoBehavior::HistoryNavigation);
+                }
+                Some((id, entry.command_line.clone()))
+            })
+        } else {
+            None
+        };
         match landing {
             HistoryLanding::FirstLineEnd => {
                 self.editor.move_to_start(false);
@@ -2575,6 +2941,7 @@ impl Reedline {
     }
 
     fn first_history(&mut self) -> io::Result<EventStatus> {
+        self.save_history_edit();
         if self.input_mode != InputMode::HistoryTraversal {
             self.history_cursor = HistoryCursor::new(
                 self.get_history_navigation_based_on_line_buffer(),
@@ -2596,6 +2963,7 @@ impl Reedline {
             return EventStatus::Inapplicable;
         }
 
+        self.save_history_edit();
         self.history_cursor.past_newest();
         self.history_last_run.set_recalled(false);
         self.input_mode = InputMode::Regular;
@@ -2604,7 +2972,10 @@ impl Reedline {
     }
 
     fn next_history(&mut self) -> io::Result<()> {
-        if self.input_mode != InputMode::HistoryTraversal {
+        self.save_history_edit();
+        if self.input_mode != InputMode::HistoryTraversal
+            && !(self.editing_history && self.recalled_history.is_some())
+        {
             self.input_mode = InputMode::HistoryTraversal;
             self.history_cursor = HistoryCursor::new(
                 self.get_history_navigation_based_on_line_buffer(),
@@ -2629,6 +3000,9 @@ impl Reedline {
         if self.history_cursor.string_at_cursor().is_none() && !self.history_last_run.is_recalled()
         {
             self.input_mode = InputMode::Regular;
+        }
+        if self.history_cursor.string_at_cursor().is_some() {
+            self.input_mode = InputMode::HistoryTraversal;
         }
         self.show_history_entry(HistoryLanding::End);
         Ok(())
@@ -2772,6 +3146,33 @@ impl Reedline {
         let mut status = EditCommandStatus::Inapplicable;
 
         for command in commands {
+            let byte_command = if self.byte_oriented {
+                match command {
+                    EditCommand::InsertChar(c)
+                        if !c.is_ascii() && crate::byte_buffer::decode_byte(*c).is_none() =>
+                    {
+                        Some(EditCommand::InsertString(crate::byte_buffer::encode(
+                            c.encode_utf8(&mut [0; 4]),
+                        )))
+                    }
+                    EditCommand::InsertString(text) if !text.is_ascii() => {
+                        Some(EditCommand::InsertString(crate::byte_buffer::encode(text)))
+                    }
+                    EditCommand::MoveToPosition { position, select } => {
+                        Some(EditCommand::MoveToPosition {
+                            position: crate::byte_buffer::offset(
+                                self.editor.get_buffer(),
+                                *position,
+                            ),
+                            select: *select,
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let command = byte_command.as_ref().unwrap_or(command);
             if let Some(command) = self.auto_pair_command(command) {
                 if self.editor.run_edit_command(&command) == EditCommandStatus::Applied {
                     status = EditCommandStatus::Applied;
@@ -3325,7 +3726,16 @@ impl Reedline {
             let res_string = self.history_cursor.string_at_cursor().unwrap_or_default();
 
             // Highlight matches
-            let res_string = if use_ansi_coloring {
+            let res_string = if let Some(colors) = &self.line_display.active_region {
+                if let Some(start) = res_string
+                    .find(&substring)
+                    .filter(|_| !substring.is_empty())
+                {
+                    active_region_text(&res_string, start..start + substring.len(), colors)
+                } else {
+                    escape_control(&res_string).into_owned()
+                }
+            } else if use_ansi_coloring && !self.editing_history {
                 let match_highlighter = SimpleMatchHighlighter::new(substring);
                 let styled = match_highlighter.highlight(&res_string, 0);
                 styled.render_simple()
@@ -3364,7 +3774,9 @@ impl Reedline {
     /// Includes the highlighting and hinting calls.
     fn buffer_paint(&mut self, prompt: &dyn Prompt) -> Result<()> {
         let use_ansi_coloring = self.effective_ansi_coloring();
-        let cursor_position_in_buffer = self.editor.insertion_point();
+        let cursor_position_in_buffer = self
+            .blink_cursor
+            .unwrap_or_else(|| self.editor.insertion_point());
         let buffer_to_paint = self.editor.get_buffer();
 
         let mut styled_text = self
@@ -3390,12 +3802,52 @@ impl Reedline {
             }
         }
 
-        let (before_cursor, after_cursor) = styled_text.render_around_insertion_point(
+        let (mut before_cursor, mut after_cursor) = styled_text.render_around_insertion_point(
             cursor_position_in_buffer,
             prompt,
             use_ansi_coloring,
             self.painter.semantic_markers(),
         );
+
+        if let Some((region, colors)) = self
+            .pasted_region
+            .as_ref()
+            .zip(self.line_display.active_region.as_ref())
+            .filter(|(region, _)| region.end <= buffer_to_paint.len())
+        {
+            if region.start < cursor_position_in_buffer {
+                before_cursor = active_region_text(
+                    &buffer_to_paint[..cursor_position_in_buffer],
+                    region.start..region.end.min(cursor_position_in_buffer),
+                    colors,
+                );
+            }
+            if cursor_position_in_buffer < region.end {
+                after_cursor = active_region_text(
+                    &buffer_to_paint[cursor_position_in_buffer..],
+                    region.start.saturating_sub(cursor_position_in_buffer)
+                        ..region.end - cursor_position_in_buffer,
+                    colors,
+                );
+            }
+        }
+        if self.byte_oriented {
+            let decoded = crate::byte_buffer::decode(buffer_to_paint);
+            let raw_cursor = buffer_to_paint[..cursor_position_in_buffer].chars().count();
+            let offset = decoded.floor_char_boundary(raw_cursor.min(decoded.len()));
+            (before_cursor, after_cursor) = (
+                escape_control(&decoded[..offset]).into_owned(),
+                escape_control(&decoded[offset..]).into_owned(),
+            );
+        }
+        let history_modified = self.line_display.mark_modified_history
+            && self.recalled_history.as_ref().is_some_and(|(_, original)| {
+                if self.byte_oriented {
+                    crate::byte_buffer::decode(buffer_to_paint) != *original
+                } else {
+                    buffer_to_paint != original
+                }
+            });
 
         // With only auto-pair closers after the cursor, as in `(gs|)`, a
         // hinter that continues the text before it hints from that text and
@@ -3466,7 +3918,7 @@ impl Reedline {
         // Needs to add return carriage to newlines because when not in raw mode
         // some OS don't fully return the carriage
 
-        let lines = if hint_replaces_closers {
+        let mut lines = if hint_replaces_closers {
             // The exit path reprints what follows the cursor, which is still
             // the closers, not the hint drawn over them.
             PromptLines::new(
@@ -3488,6 +3940,14 @@ impl Reedline {
                 &hint,
             )
         };
+        if history_modified {
+            lines.prompt_str_left.to_mut().insert(0, '*');
+        }
+        if self.line_display.horizontal_scroll
+            || (self.editing_history && self.painter.screen_height() == 1)
+        {
+            lines.scroll_horizontally(self.painter.screen_width());
+        }
         // History search paints elsewhere, so only submit hides the status
         // line here. Measured only with one to show, since the measure walks
         // the whole buffer.
@@ -3672,11 +4132,16 @@ impl Reedline {
     }
 
     fn submit_buffer(&mut self, prompt: &dyn Prompt) -> io::Result<EventStatus> {
+        self.save_history_edit();
+        self.pasted_region = None;
+        if self.line_display.revert_history_on_submit {
+            self.history_edits.clear();
+        }
         // A menu that let the submit through (no suggestions to accept) must
         // not stay active into the next line's editing.
         self.deactivate_menus();
         #[cfg_attr(not(feature = "system_clipboard"), allow(unused_mut))]
-        let mut buffer = self.editor.get_buffer().to_string();
+        let mut buffer = self.host_buffer().0;
         // Let an installed paste interceptor replace the line at submit (e.g.
         // expand paste-reference placeholders — the compact form is only for
         // composing). Done before the repaint below so reedline itself paints
@@ -3745,6 +4210,7 @@ impl Reedline {
                 }
             }
         }
+        self.recalled_history = None;
         self.run_edit_commands(&[EditCommand::Clear]);
         self.editor.reset_undo_stack();
 

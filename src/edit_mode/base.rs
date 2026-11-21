@@ -12,6 +12,15 @@ pub trait EditMode: Send {
     /// Translate the given user input event into what the `LineEditor` understands
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent;
 
+    /// Returns the next synthetic input event, if any, before reading the terminal.
+    ///
+    /// Ordered input dispatch delivers one event at a time to the editor, so a
+    /// key can queue input that runs before any already buffered physical key.
+    /// Unread synthetic input stays with the mode when a line is submitted.
+    fn next_replay_event(&mut self) -> Option<ReedlineRawEvent> {
+        None
+    }
+
     /// What to display in the prompt indicator
     fn edit_mode(&self) -> PromptEditMode;
 

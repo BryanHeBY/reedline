@@ -444,6 +444,7 @@ impl PromptStartRow {
 pub struct Painter {
     // Stdout
     stdout: W,
+    pub(crate) cursor_query: Option<Box<dyn Fn() -> Result<(u16, u16)> + Send + Sync>>,
     prompt_start_row: PromptStartRow,
     // The number of lines that the prompt takes up
     prompt_height: u16,
@@ -486,6 +487,7 @@ impl Painter {
         let term_is_dumb = term_is_dumb(term.as_deref());
         Painter {
             stdout,
+            cursor_query: None,
             prompt_start_row: PromptStartRow::Unverified,
             prompt_height: 0,
             terminal_size: (0, 0),
@@ -543,11 +545,20 @@ impl Painter {
     /// `Ok(None)` is [`cursor_position_for_term`]'s: no query was made, so
     /// there is no row to grow to.
     fn measure_cursor_position(&mut self) -> Result<Option<(u16, u16)>> {
-        let position = cursor_position_for_term(&self.stdout, self.term_is_dumb)?;
+        let position = self.query_cursor_position()?;
         if let Some((_, row)) = position {
             self.grow_screen_height_to_fit_row(row);
         }
         Ok(position)
+    }
+
+    fn query_cursor_position(&self) -> Result<Option<(u16, u16)>> {
+        if !self.term_is_dumb {
+            if let Some(query) = &self.cursor_query {
+                return query().map(Some);
+            }
+        }
+        cursor_position_for_term(&self.stdout, self.term_is_dumb)
     }
 
     /// Reconcile a stale anchor: something yielded the tty since the last paint
@@ -793,9 +804,7 @@ impl Painter {
             was_flush_at_bottom: final_row >= self.screen_height().saturating_sub(1),
             // One DSR round-trip per suspension is cheap next to whatever the host
             // is about to run, and it turns "might have scrolled" into a fact.
-            cursor: cursor_position_for_term(&self.stdout, self.term_is_dumb)
-                .ok()
-                .flatten(),
+            cursor: self.query_cursor_position().ok().flatten(),
         }
     }
 
