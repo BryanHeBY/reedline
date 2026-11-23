@@ -485,11 +485,13 @@ impl PromptStartRow {
     }
 }
 
+pub(crate) type CursorPositionQuery = Box<dyn Fn() -> Result<(u16, u16)> + Send + Sync>;
+
 /// Implementation of the output to the terminal
 pub struct Painter {
     // Stdout
     stdout: W,
-    pub(crate) cursor_query: Option<Box<dyn Fn() -> Result<(u16, u16)> + Send + Sync>>,
+    pub(crate) cursor_query: Option<CursorPositionQuery>,
     prompt_start_row: PromptStartRow,
     // The number of lines that the prompt takes up
     prompt_height: u16,

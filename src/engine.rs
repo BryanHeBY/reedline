@@ -27,8 +27,8 @@ use {
             HistoryNavigationQuery, HistorySessionId, SearchDirection, SearchQuery,
         },
         painting::{
-            continue_hint_lines, escape_control, escape_control_keep_sgr, Painter,
-            PainterSuspendedState, PromptLines, RenderSnapshot, TerminalTakenSignal, W,
+            continue_hint_lines, escape_control, escape_control_keep_sgr, CursorPositionQuery,
+            Painter, PainterSuspendedState, PromptLines, RenderSnapshot, TerminalTakenSignal, W,
         },
         prompt::{PromptEditMode, PromptHistorySearchStatus},
         result::{ReedlineError, ReedlineErrorVariants},
@@ -81,6 +81,8 @@ const EVENTS_THRESHOLD: usize = 10;
 /// for features that require periodic processing (e.g., external printer,
 /// idle callback).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+type InputSource = Box<dyn FnMut(Duration) -> io::Result<Option<Event>> + Send>;
 
 /// Optional Readline-compatible presentation and history editing behavior.
 #[derive(Default)]
@@ -345,7 +347,7 @@ pub struct Reedline {
     // Physical input buffered while synthetic key events are replaying.
     ordered_events: Option<VecDeque<Event>>,
     ordered_repaint: bool,
-    input_source: Option<Box<dyn FnMut(Duration) -> io::Result<Option<Event>> + Send>>,
+    input_source: Option<InputSource>,
 
     // Whether lines should be accepted immediately
     immediately_accept: bool,
@@ -1407,19 +1409,13 @@ impl Reedline {
 
     /// Installs an optional terminal event reader for ordered input. The
     /// reader returns None when no event arrives within the supplied timeout.
-    pub fn set_input_source(
-        &mut self,
-        source: Option<Box<dyn FnMut(Duration) -> io::Result<Option<Event>> + Send>>,
-    ) {
+    pub fn set_input_source(&mut self, source: Option<InputSource>) {
         self.input_source = source;
     }
 
     /// Uses the host's cursor-position reader for terminal queries. A custom
     /// input source and the cursor reader should share the same event stream.
-    pub fn set_cursor_position_query(
-        &mut self,
-        query: Option<Box<dyn Fn() -> io::Result<(u16, u16)> + Send + Sync>>,
-    ) {
+    pub fn set_cursor_position_query(&mut self, query: Option<CursorPositionQuery>) {
         self.painter.cursor_query = query;
     }
 
